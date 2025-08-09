@@ -1,0 +1,10 @@
+[Unit]
+Description=IP-Tag timer (executa periodicamente o serviço oneshot)
+
+[Timer]
+OnUnitActiveSec=3min
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -Euo pipefail
+CONF="/opt/iptag/iptag.conf"; RUN="/usr/local/bin/iptag-run"
+usage(){ echo "uso: iptag-color --bg HEX --fg HEX"; }
+bg=""; fg=""
+while [[ $# -gt 0 ]]; do case "$1" in --bg) bg="${2:-}"; shift 2 ;; --fg) fg="${2:-}"; shift 2 ;; *) usage; exit 1;; esac; done
+[[ "$bg" =~ ^[0-9A-Fa-f]{6}$ ]] && [[ "$fg" =~ ^[0-9A-Fa-f]{6}$ ]] || { usage; exit 1; }
+sed -i "s/^IP_COLOR_BG=.*/IP_COLOR_BG=\"${bg}\"/; s/^IP_COLOR_FG=.*/IP_COLOR_FG=\"${fg}\"/" "$CONF"
+echo ">> cores atualizadas: BG=$bg FG=$fg"
+if [[ -x "$RUN" ]]; then "$RUN" || true; else /opt/iptag/iptag || true; fi

@@ -1,0 +1,10 @@
+/var/log/iptag.log {
+    size 10M
+    rotate 14
+    missingok
+    notifempty
+    compress
+    delaycompress
+    create 0640 root adm
+    copytruncate
+}

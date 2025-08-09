@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+set -Euo pipefail
+CONFIG_FILE="/opt/iptag/iptag.conf"
+DEFAULT_TAG_FORMAT="full"
+
+RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; BLUE=$'\033[0;34m'; CYAN=$'\033[0;36m'; GRAY=$'\033[0;37m'; NC=$'\033[0m'
+log_success(){ echo -e "${GREEN}✓${NC} $*"; }
+log_info()   { echo -e "${BLUE}ℹ${NC} $*"; }
+log_same()   { echo -e "${GRAY}=${NC} $*"; }
+log_change() { echo -e "${CYAN}~${NC} $*"; }
+file_log(){ [[ -n "${LOG_FILE:-}" ]] && printf '%s %s\n' "$(date +'%F %T')" "$*" >> "$LOG_FILE" || true; }
+debug(){ [[ "${DEBUG:-false}" == "true" || "${DEBUG:-0}" == "1" ]] && echo "[DEBUG] $*" >&2; }
+
+[[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE" || true
+LOG_FILE=${LOG_FILE:-}; DEBUG=${DEBUG:-false}
+declare -a CIDR_LIST BRIDGE_ALLOWLIST
+IP_TAG_MODE=${IP_TAG_MODE:-fixed}
+IP_FIXED_TAG=${IP_FIXED_TAG:-ipaddr}
+IP_COLOR_BG=${IP_COLOR_BG:-0066FF}
+IP_COLOR_FG=${IP_COLOR_FG:-FFFFFF}
+IP_COLORIZE_NUMERIC_TAGS=${IP_COLORIZE_NUMERIC_TAGS:-false}
+
+# collector for painter
+declare -Ag __COLOR_TAGS_SEEN=(); remember_color_tag(){ local t="${1:-}"; [[ -n "$t" ]] && __COLOR_TAGS_SEEN["$t"]=1; }
+
+is_valid_ipv4(){ local ip=${1:-}; [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1; IFS='.' read -r a b c d <<<"$ip"; ((a<=255&&b<=255&&c<=255&&d<=255)); }
+ip_like_numeric(){ [[ "${1:-}" =~ ^([0-9]+(\.[0-9]+){1,3}|[0-9]+(\.[0-9]+)*)$ ]]; }
+ip_in_cidr(){ local ip="$1" cidr="$2" n p; IFS='/' read -r n p <<<"$cidr"; IFS='.' read -r a b c d <<<"$ip"; local ii=$(( (a<<24)+(b<<16)+(c<<8)+d )); IFS='.' read -r a b c d <<<"$n"; local ni=$(( (a<<24)+(b<<16)+(c<<8)+d )); local m=$(( 0xFFFFFFFF << (32 - p) & 0xFFFFFFFF )); (( (ii & m) == (ni & m) )); }
+ip_in_cidrs(){ local ip="$1"; shift || true; local -a cs=( "$@" ); for c in "${cs[@]}"; do ip_in_cidr "$ip" "$c" && return 0; done; return 1; }
+format_ip_tag(){ local ip="$1" f="${TAG_FORMAT:-$DEFAULT_TAG_FORMAT}"; case "$f" in last_octet) echo "${ip##*.}" ;; last_two_octets) echo "${ip#*.*.}" ;; *) echo "$ip" ;; esac; }
+bridge_allowed(){ local br="${1:-}"; [[ -z "$br" ]] && return 1; [[ "${#BRIDGE_ALLOWLIST[@]}" -eq 0 ]] && return 0; for b in "${BRIDGE_ALLOWLIST[@]}"; do [[ "$b" == "$br" ]] && return 0; done; return 1; }
+
+get_vm_ips(){ local vmid="${1:-}"; [[ -n "$vmid" ]] || return 0
+  local ips="" cfg="/etc/pve/qemu-server/${vmid}.conf"; [[ -f "$cfg" ]] || return 0
+  local st; st="$(qm status "$vmid" 2>/dev/null | awk '{print $2}')" || true; [[ "$st" == "running" ]] || return 0
+  local cache="/tmp/iptag_vm_${vmid}_cache" ttl="${VM_IP_CACHE_TTL:-60}"
+  if [[ -f "$cache" ]] && (( $(date +%s) - $(stat -c %Y "$cache" 2>/dev/null || echo 0) < ttl )); then cat "$cache"; return 0; fi
+  local brs macs
+  brs=$(grep -E "^net[0-9]+:" "$cfg" | grep -oE 'bridge=[^,]+' | cut -d= -f2 | xargs -n1 echo | sort -u) || true
+  macs=$(grep -E "^net[0-9]+:" "$cfg" | grep -oE "([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}") || true
+  for br in $brs; do bridge_allowed "$br" || continue
+    for mac in $macs; do
+      local ip; ip=$(ip neighbor show dev "$br" 2>/dev/null | grep -i "$mac" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1) || true
+      [[ -n "$ip" ]] && ips+="$ip "
+    done
+  done
+  if [[ -z "$ips" ]]; then
+    local qi; qi=$(timeout 3 qm guest cmd "$vmid" network-get-interfaces 2>/dev/null | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | grep -v '^127\.0\.0\.1$' | head -4) || true
+    for ip in $qi; do ips+="$ip "; done
+  fi
+  echo "${ips%% }" | tee "$cache" >/dev/null
+}
+
+get_lxc_ips(){ local vmid="${1:-}"; [[ -n "$vmid" ]] || return 0
+  local cfg="/etc/pve/lxc/${vmid}.conf"; local st="$(pct status "$vmid" 2>/dev/null | awk '{print $2}')" || true
+  [[ "$st" == "running" ]] || return 0
+  if [[ -f "$cfg" ]]; then
+    local sip; sip=$(grep -E "^net[0-9]+:" "$cfg" | grep -oE 'ip=([0-9]{1,3}\.){3}[0-9]{1,3}' | cut -d= -f2 | head -1) || true
+    [[ -n "$sip" ]] && { echo "$sip"; return 0; }
+  fi
+  local br mac; br=$(grep -Eo 'bridge=[^,]+' "$cfg" 2>/dev/null | head -1 | cut -d= -f2 || true)
+  mac=$(grep -Eo 'hwaddr=([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}' "$cfg" 2>/dev/null | cut -d= -f2 || true)
+  bridge_allowed "$br" || return 0
+  if [[ -n "$br" && -n "$mac" ]]; then
+    local ip; ip=$(ip neighbor show dev "$br" 2>/dev/null | grep -i "$mac" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1) || true
+    [[ -n "$ip" ]] && { echo "$ip"; return 0; }
+  fi
+}
+
+update_tags(){ local type="$1" id="$2" curr="" ips=""
+  [[ -n "$id" ]] || { echo "same"; return 0; }
+  if [[ "$type" == "lxc" ]]; then ips="$(get_lxc_ips "$id" || true)"; curr="$(pct config "$id" 2>/dev/null | awk -F': ' '/^tags:/ {print $2}')"
+  else ips="$(get_vm_ips "$id"  || true)"; curr="$(qm  config "$id" 2>/dev/null | awk -F': ' '/^tags:/ {print $2}')"; fi
+  IFS=';' read -r -a cur_tags <<< "${curr:-}"
+  local next=()
+  for t in "${cur_tags[@]}"; do [[ -z "$t" ]] && continue; if is_valid_ipv4 "$t" || ip_like_numeric "$t"; then continue; fi; next+=("$t"); done
+  if [[ "$IP_TAG_MODE" != "numeric" && -n "$IP_FIXED_TAG" ]]; then
+    local has=false; for t in "${next[@]}"; do [[ "$t" == "$IP_FIXED_TAG" ]] && has=true; done
+    $has || next+=("$IP_FIXED_TAG"); remember_color_tag "$IP_FIXED_TAG"
+  fi
+  if [[ "$IP_TAG_MODE" != "fixed" ]]; then
+    local ntags=()
+    for ip in $ips; do is_valid_ipv4 "$ip" || continue; ip_in_cidrs "$ip" "${CIDR_LIST[@]}" || continue; ntags+=("$(format_ip_tag "$ip")"); done
+    next+=("${ntags[@]}")
+    if [[ "$IP_COLORIZE_NUMERIC_TAGS" == "true" ]]; then for nt in "${ntags[@]}"; do ip_like_numeric "$nt" && remember_color_tag "$nt"; done; fi
+  fi
+  local old="$(IFS=';'; echo "${cur_tags[*]}")"; local new="$(IFS=';'; echo "${next[*]}")"
+  if [[ "$old" != "$new" ]]; then
+    if [[ "$type" == "lxc" ]]; then pct set "$id" -tags "$new" &>/dev/null || true; else qm set "$id" -tags "$new" &>/dev/null || true; fi
+    log_change "${type^^} ${CYAN}${id}${NC}: tags → [${new}]"; file_log "UPDATED ${type} ${id}: ${new}"; echo "updated"
+  else log_same "${type^^} ${GRAY}${id}${NC}: sem alterações"; echo "same"; fi
+}
+
+process_type(){ local type="$1"; shift || true; local -a ids=( "$@" ); local u=0 s=0
+  for id in "${ids[@]}"; do [[ -n "$id" ]] || continue; if [[ "$(update_tags "$type" "$id" || true)" == "updated" ]]; then ((u++)); else ((s++)); fi; done
+  echo "$u $s"
+}
+
+apply_color_map(){ ((${#__COLOR_TAGS_SEEN[@]})) || return 0
+  local cur map tag
+  cur="$(pvesh get /cluster/options --output-format json 2>/dev/null | tr -d '\n' | sed -n 's/.*"tag-style":"color-map=\([^"\]*\)".*/\1/p')" || true
+  map="$cur"
+  for tag in "${!__COLOR_TAGS_SEEN[@]}"; do [[ -z "$tag" ]] && continue; [[ -n "$map" ]] && echo "$map" | grep -qE "(^|,)$tag:" && continue; map="${map:+$map,}${tag}:${IP_COLOR_BG}:${IP_COLOR_FG}"; done
+  [[ -n "$map" ]] && pvesh set /cluster/options --tag-style "color-map=${map}" >/dev/null 2>&1 || true
+}
+
+main(){
+  echo -e "\n${BLUE}ℹ${NC} Passagem única do IP-Tag (timer-based)"
+  mapfile -t LXCS < <(pct list 2>/dev/null | awk 'NR>1{print $1}') || true
+  mapfile -t VMS  < <(ls -1 /etc/pve/qemu-server/*.conf 2>/dev/null | sed 's#.*/\([0-9]\+\)\.conf#\1#' | sort -n) || true
+  local lu=0 ls=0 vu=0 vs=0
+  ((${#LXCS[@]})) && read lu ls < <(process_type "lxc" "${LXCS[@]}")
+  ((${#VMS[@]}))  && read vu vs < <(process_type "vm"  "${VMS[@]}")
+  apply_color_map
+  log_success "OK. LXC: ${lu} atualizadas / ${ls} inalteradas | VM: ${vu} atualizadas / ${vs} inalteradas"
+  file_log "SUMMARY LXC(updated=${lu},same=${ls}) VM(updated=${vu},same=${vs})"
+  if [[ -d /var/lib/node_exporter/textfile_collector ]]; then
+    cat > /var/lib/node_exporter/textfile_collector/iptag.prom <<METRICS
+iptag_lxc_updated ${lu}
+iptag_lxc_same ${ls}
+iptag_vm_updated ${vu}
+iptag_vm_same ${vs}
+METRICS
+  fi
+  exit 0
+}
+main

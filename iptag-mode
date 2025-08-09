@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -Euo pipefail
+CONF="/opt/iptag/iptag.conf"; RUN="/usr/local/bin/iptag-run"
+usage(){ cat <<USAGE
+uso: iptag-mode <fixed|numeric|both> [--bg HEX] [--fg HEX] [--colorize-numeric true|false]
+USAGE
+}
+ensure_kv(){ local k="$1" v="$2"; grep -qE "^[[:space:]]*${k}=" "$CONF" && sed -i "s#^[[:space:]]*${k}=.*#${k}=${v}#g" "$CONF" || printf "%s=%s\n" "$k" "$v" >> "$CONF"; }
+mode="${1:-}"; shift || true
+[[ -f "$CONF" ]] || { echo "config não encontrado: $CONF"; exit 1; }
+case "$mode" in fixed|numeric|both) ;; ""|--help|-h) usage; exit 0 ;; *) echo "modo inválido: $mode"; usage; exit 1 ;; esac
+bg=""; fg=""; colorize=""
+while [[ $# -gt 0 ]]; do case "$1" in --bg) bg="${2:-}"; shift 2 ;; --fg) fg="${2:-}"; shift 2 ;; --colorize-numeric) colorize="${2:-}"; shift 2 ;; *) echo "opção desconhecida: $1"; usage; exit 1 ;; esac; done
+[[ -n "$bg" ]] && [[ "$bg" =~ ^[0-9A-Fa-f]{6}$ ]] || [[ -z "$bg" ]] || { echo "bg inválido"; exit 1; }
+[[ -n "$fg" ]] && [[ "$fg" =~ ^[0-9A-Fa-f]{6}$ ]] || [[ -z "$fg" ]] || { echo "fg inválido"; exit 1; }
+[[ -n "$colorize" ]] && [[ "$colorize" =~ ^(true|false)$ ]] || [[ -z "$colorize" ]] || { echo "colorize-numeric deve ser true/false"; exit 1; }
+ensure_kv 'IP_TAG_MODE' "\"$mode\""
+[[ -n "$bg" ]] && ensure_kv 'IP_COLOR_BG' "\"$bg\""
+[[ -n "$fg" ]] && ensure_kv 'IP_COLOR_FG' "\"$fg\""
+[[ -n "$colorize" ]] && ensure_kv 'IP_COLORIZE_NUMERIC_TAGS' "$colorize"
+echo ">> IP_TAG_MODE=$mode aplicado."; [[ -n "$bg" ]] && echo ">> BG=$bg"; [[ -n "$fg" ]] && echo ">> FG=$fg"; [[ -n "$colorize" ]] && echo ">> IP_COLORIZE_NUMERIC_TAGS=$colorize"
+if [[ -x "$RUN" ]]; then "$RUN" || true; else /opt/iptag/iptag || true; fi
